@@ -1,5 +1,5 @@
 # PageScrollView
-ScrollView scroll by Page
+ScrollView scroll by Page and custom draw scrollbar
 # attrs
  - radius
  - thumbColor
