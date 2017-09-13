@@ -14,9 +14,9 @@ import android.graphics.RectF;
 import android.os.Build;
 import android.util.AttributeSet;
 import android.util.Log;
-import android.view.GestureDetector;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.widget.ScrollView;
 
@@ -27,11 +27,20 @@ import android.widget.ScrollView;
  */
 public class PageScrollView extends ScrollView{
     private static final String TAG = PageScrollView.class.getSimpleName();
+    private float mLastMotionX;
+    private float mLastMotionY;
+    private static final int TOUCH_STATE_REST = 0;
+    private static final int TOUCH_STATE_SCROLLING = 1;
+    private int mTouchState = TOUCH_STATE_REST;
+    private static final int INVALID_POINTER = -1;
+    private int mActivePointerId = INVALID_POINTER;
+    private boolean mAllowLongPress = true;
+    private boolean mFlingFinished = true;
     private static final boolean ENABLE_LEFT_RIGHT_SLOP = false;
     private static final int PAGING_TOUCH_SLOP = 96;
+    private final int mTouchSlop;
     private final int mPagingTouchSlop;
     private boolean mDisallowInterceptTouch;
-    private GestureDetector mDetector;
     private Paint mPaint;
     private float mTrackWidth, mThumbWidth, mRadius;
     private int mThumbColor, mTrackColor;
@@ -41,6 +50,7 @@ public class PageScrollView extends ScrollView{
      * 滚动条最小高度
      */
     private final static int M_SCROLL_MIN_HEIGHT = 20;
+    private static final boolean DEBUG = false;
 
     public PageScrollView(Context context) {
         this(context, null);
@@ -58,17 +68,9 @@ public class PageScrollView extends ScrollView{
     public PageScrollView(Context context, AttributeSet attrs, int defStyleAttr,
             int defStyleRes) {
         super(context, attrs, defStyleAttr, defStyleRes);
+        final ViewConfiguration configuration = ViewConfiguration.get(getContext());
+        mTouchSlop = configuration.getScaledTouchSlop();
         mPagingTouchSlop = PAGING_TOUCH_SLOP;
-        mDetector = new GestureDetector(context, new GestureDetector.SimpleOnGestureListener(){
-
-            @Override
-            public boolean onFling(MotionEvent e1, MotionEvent e2,
-                    float velocityX, float velocityY) {
-                if (checkStartScroll(e1, e2, velocityX, velocityY))
-                    return true;
-                return super.onFling(e1, e2, velocityX, velocityY);
-            }
-        });
         init(context, attrs, defStyleAttr,  defStyleRes);
     }
     
@@ -103,9 +105,297 @@ public class PageScrollView extends ScrollView{
     }
     
     @Override
-    public boolean dispatchTouchEvent(MotionEvent ev) {
-        mDetector.onTouchEvent(ev);
-        return true;
+    public boolean onTouchEvent(MotionEvent ev) {
+        boolean ret;
+        Log.d(TAG, "----onTouchEvent----");
+        if (!canScroll()) {
+            // We don't want the events.  Let them fall through to the all apps view.
+            ret = false;
+            if (DEBUG) {
+                Log.d(TAG, String.format("touchdebug onTouchEvent return(%s)", ret));
+            }
+            return ret;
+        }
+        final int action = ev.getAction();
+        if (DEBUG) {
+            Log.d(TAG, String.format("onTouchEvent action %s up(%s)", action & MotionEvent.ACTION_MASK, MotionEvent.ACTION_UP));
+        }
+        switch (action & MotionEvent.ACTION_MASK) {
+        case MotionEvent.ACTION_DOWN:
+            /*
+             * If being flinged and user touches, stop the fling. isFinished
+             * will be false if being flinged.
+             */
+            mFlingFinished = true;
+            // Remember where the motion event started
+            mLastMotionX = ev.getX();
+            mLastMotionY = ev.getY();
+            mActivePointerId = ev.getPointerId(0);
+            break;
+        case MotionEvent.ACTION_MOVE:
+            final int pointerIndex = ev.findPointerIndex(mActivePointerId);
+            if (pointerIndex > -1) {
+                final float x =  ev.getX(pointerIndex);
+                final float y =  ev.getY(pointerIndex);
+                if (mTouchState == TOUCH_STATE_SCROLLING) {
+                    checkStartScroll(x, y);
+                }else {
+                    checkInScrolling(ev, x, y);
+                }
+            }
+            break;
+        case MotionEvent.ACTION_UP:
+            if (DEBUG) {
+                Log.d(TAG, "touchdebug onTouchEvent up");
+            }
+            disallowParentAndChildInterceptTouchEvent(false);
+            boolean startScroll = true;
+            if (mTouchState == TOUCH_STATE_SCROLLING) {
+                startScroll = false;
+                final int index = ev.findPointerIndex(mActivePointerId);
+                if (index > -1) {
+                    final float x =  ev.getX(index);
+                    final float y =  ev.getY(index);
+                    startScroll = checkStartScroll(x, y);
+                }
+            }
+            if(!startScroll){
+                Log.i(TAG, "out of min distance:" + mPagingTouchSlop);
+            }
+            mFlingFinished = true;
+            mTouchState = TOUCH_STATE_REST;
+            mActivePointerId = INVALID_POINTER;
+            break;
+        case MotionEvent.ACTION_CANCEL:
+            mTouchState = TOUCH_STATE_REST;
+            mActivePointerId = INVALID_POINTER;
+            break;
+        case MotionEvent.ACTION_POINTER_UP:
+            onSecondaryPointerUp(ev);
+            break;
+        }
+        ret = true;
+        if (DEBUG) {
+            Log.d(TAG, String.format("touchdebug onTouchEvent return(%s)", ret));
+        }
+        return ret;
+    }
+
+    private boolean checkStartScroll(float x, float y) {
+        boolean startScroll = false;
+        float slope = 0;
+        final float dx = x - mLastMotionX;
+        final float dy = y - mLastMotionY;
+        if (Math.abs(dx) > mPagingTouchSlop) {
+            startScroll = ENABLE_LEFT_RIGHT_SLOP;
+        }
+        if (Math.abs(dy) > mPagingTouchSlop) {
+            startScroll = true;
+        }
+        if (startScroll) {
+            disallowParentAndChildInterceptTouchEvent(true);
+        }
+        if (startScroll) {
+            if (dx != 0) {
+                slope = Math.abs(dy / dx);
+            } else {
+                slope = 2; //一直以dy做主导
+            }
+            mFlingFinished = false;
+            if (slope >= 1) {
+                if (dy < 0) {
+                    nextPage();
+                }else {
+                    prePage();
+                }
+            }else {
+                if (ENABLE_LEFT_RIGHT_SLOP) {
+                    if (dx < 0) {
+                        nextPage();
+                    }else {
+                        prePage();
+                    }
+                }
+            }
+            mFlingFinished = true;
+            mTouchState = TOUCH_STATE_REST;
+            mActivePointerId = INVALID_POINTER;
+        }
+        Log.d(TAG, String.format("startScroll:%b,slope:%s,dy:%s,dx:%s", startScroll, slope, dy, dx));
+        return startScroll;
+    }
+
+    private void disallowParentAndChildInterceptTouchEvent(boolean disabled) {
+        if (mDisallowInterceptTouch != disabled) {
+            mDisallowInterceptTouch = disabled;
+            requestChildDisallowInterceptTouchEvent(disabled);
+            getParent().requestDisallowInterceptTouchEvent(disabled);
+        }
+    }
+
+    private void checkInScrolling(MotionEvent ev, float x, float y) {
+        if (mActivePointerId == INVALID_POINTER) {
+            if (DEBUG) {
+                Log.d(TAG, "not init LastMotion try init");
+            }
+            mLastMotionX = x;
+            mLastMotionY = y;
+            mActivePointerId = ev.getPointerId(0);
+            mAllowLongPress = true;
+        }else {
+            final int xDiff = (int) Math.abs(x - mLastMotionX);
+            final int yDiff = (int) Math.abs(y - mLastMotionY);
+            final int touchSlop = mTouchSlop;
+            boolean xMoved = xDiff > touchSlop;
+            boolean yMoved = yDiff > touchSlop;
+            if (xMoved || yMoved) {
+                // Scroll if the user moved far enough along the X axis
+                mTouchState = TOUCH_STATE_SCROLLING;
+                // Either way, cancel any pending longpress
+                if (mAllowLongPress) {
+                    mAllowLongPress = false;
+                    // Try canceling the long press. It could also have been scheduled
+                    // by a distant descendant, so use the mAllowLongPress flag to block
+                    // everything
+                    cancelChildLongPress();
+                    this.cancelLongPress();
+                }
+            }
+        }
+    }
+
+    /**
+     * @return True is long presses are still allowed for the current touch
+     */
+    public boolean allowLongPress() {
+        return mAllowLongPress;
+    }
+
+    /**
+     * Set true to allow long-press events to be triggered, usually checked by
+     * {@link Launcher} to accept or block dpad-initiated long-presses.
+     */
+    public void setAllowLongPress(boolean allowLongPress) {
+        mAllowLongPress = allowLongPress;
+    }
+
+    @Override
+    public boolean onInterceptTouchEvent(MotionEvent ev) {
+        boolean ret;
+        Log.d(TAG, "----onInterceptTouchEvent----");
+        if (!canScroll()) {
+            // We don't want the events.  Let them fall through to the all apps view.
+            ret = false;
+            if (DEBUG) {
+                Log.d(TAG, String.format("touchdebug onInterceptTouchEvent return(%s)", ret));
+            }
+            return ret;
+        }
+        final int action = ev.getAction();
+        if (DEBUG) {
+            Log.d(TAG, String.format("onInterceptTouchEvent action %s up(%s) evx %s evy %s",
+                action & MotionEvent.ACTION_MASK, MotionEvent.ACTION_UP, ev.getX(), ev.getY()));
+        }
+        if ((action == MotionEvent.ACTION_MOVE) && (mTouchState != TOUCH_STATE_REST)) {
+            ret = true;
+            if (DEBUG) {
+                Log.d(TAG, String.format("touchdebug onInterceptTouchEvent return(%s)", ret));
+            }
+            return ret;
+        }
+        switch (action & MotionEvent.ACTION_MASK) {
+            case MotionEvent.ACTION_MOVE: {
+                final int pointerIndex = ev.findPointerIndex(mActivePointerId);
+                if (pointerIndex == -1) {
+                    Log.e(TAG, "pointerIndex out of range return super onInterceptTouchEvent");
+                    ret = super.onInterceptTouchEvent(ev);
+                    if (DEBUG) {
+                        Log.d(TAG, String.format("touchdebug onInterceptTouchEvent return(%s)", ret));
+                    }
+                    return ret;
+                }
+                final float x = ev.getX(pointerIndex);
+                final float y = ev.getY(pointerIndex);
+                checkInScrolling(ev, x, y);
+                break;
+            }
+            case MotionEvent.ACTION_DOWN: {
+                if (DEBUG) {
+                    Log.d(TAG, "touchdebug onInterceptTouchEvent ACTION_DOWN");
+                }
+                final float x = ev.getX();
+                final float y = ev.getY();
+                mLastMotionX = x;
+                mLastMotionY = y;
+                mActivePointerId = ev.getPointerId(0);
+                mAllowLongPress = true;
+                /*
+                 * If being flinged and user touches the screen, initiate drag;
+                 * otherwise don't.  mScroller.isFinished should be false when
+                 * being flinged.
+                 */
+                mTouchState = mFlingFinished ? TOUCH_STATE_REST : TOUCH_STATE_SCROLLING;
+                break;
+            }
+            case MotionEvent.ACTION_CANCEL:
+            case MotionEvent.ACTION_UP:
+                if (DEBUG) {
+                    Log.d(TAG, "touchdebug onInterceptTouchEvent up");
+                }
+                // Release the drag
+                mTouchState = TOUCH_STATE_REST;
+                mActivePointerId = INVALID_POINTER;
+                mAllowLongPress = false;
+                break;
+
+            case MotionEvent.ACTION_POINTER_UP:
+                onSecondaryPointerUp(ev);
+                break;
+        }
+        /*
+         * The only time we want to intercept motion events is if we are in the
+         * drag mode.
+         */
+        ret = mTouchState != TOUCH_STATE_REST;
+        if (DEBUG) {
+            Log.d(TAG, String.format("touchdebug onInterceptTouchEvent return(%s)", ret));
+        }
+        return ret;
+    }
+
+    private void cancelChildLongPress() {
+        int count = getChildCount();
+        for (int i = 0; i < count; i++) {
+            View child = getChildAt(i);
+            if (child == null)
+                continue;
+            child.cancelLongPress();
+        }
+    }
+
+    private void requestChildDisallowInterceptTouchEvent(boolean disabled) {
+        int count = getChildCount();
+        for (int i = 0; i < count; i++) {
+            View child = getChildAt(i);
+            if (child != null && child instanceof ViewGroup){
+                ((ViewGroup)child).requestDisallowInterceptTouchEvent(disabled);
+            }
+        }
+    }
+
+    private void onSecondaryPointerUp(MotionEvent ev) {
+        final int pointerIndex = (ev.getAction() & MotionEvent.ACTION_POINTER_INDEX_MASK) >>
+                MotionEvent.ACTION_POINTER_INDEX_SHIFT;
+        final int pointerId = ev.getPointerId(pointerIndex);
+        if (pointerId == mActivePointerId) {
+            // This was our active pointer going up. Choose a new
+            // active pointer and adjust accordingly.
+            // TODO: Make this decision more intelligent.
+            final int newPointerIndex = pointerIndex == 0 ? 1 : 0;
+            mLastMotionX = ev.getX(newPointerIndex);
+            mLastMotionY = ev.getY(newPointerIndex);
+            mActivePointerId = ev.getPointerId(newPointerIndex);
+        }
     }
     
     @Override
@@ -431,21 +721,4 @@ public class PageScrollView extends ScrollView{
         }
     }
 
-    private void disallowParentAndChildInterceptTouchEvent(boolean disabled) {
-        if (mDisallowInterceptTouch != disabled) {
-            mDisallowInterceptTouch = disabled;
-            requestChildDisallowInterceptTouchEvent(disabled);
-            getParent().requestDisallowInterceptTouchEvent(disabled);
-        }
-    }
-
-    private void requestChildDisallowInterceptTouchEvent(boolean disabled) {
-        int count = getChildCount();
-        for (int i = 0; i < count; i++) {
-            View child = getChildAt(i);
-            if (child != null && child instanceof ViewGroup){
-                ((ViewGroup)child).requestDisallowInterceptTouchEvent(disabled);
-            }
-        }
-    }
 }
