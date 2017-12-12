@@ -668,8 +668,11 @@ public class PageScrollView extends ScrollView{
             final View child = getChildAt(0);
             if (child.getVisibility() != GONE) {
                 final int height = child.getMeasuredHeight();
+                int child_left = child.getLeft();
+                int child_right = child.getRight();
+                int child_top = child.getTop();
                 int total = getPage(height, getMeasuredHeight());
-                child.layout(left, top, right, top + getMeasuredHeight() * total);
+                child.layout(child_left, child_top, child_right, child_top + getMeasuredHeight() * total);
             }
         }
     }
